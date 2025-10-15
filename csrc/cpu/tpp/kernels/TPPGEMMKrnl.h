@@ -770,6 +770,213 @@ inline void tpp_fused_gate_up_proj(
 }
 
 template <typename T>
+inline void tpp_ffn_swiglu(
+    const at::Tensor& t_in,
+    const at::Tensor& t_wt_gate,
+    const at::Tensor& t_bias_gate,
+    const at::Tensor& t_wt_up,
+    const at::Tensor& t_bias_up,
+    const at::Tensor& t_wt_down,
+    const at::Tensor& t_bias_down,
+    at::Tensor& t_out,
+    int b_vnni) {
+  // This is a placeholder implementation for FFN with SwiGLU activation
+  // The detailed AMX assembly-level optimization should be implemented here
+  // by the user as mentioned in the requirements.
+  
+  // Step 1: Fuse gate and up projections (similar to tpp_fused_gate_up_proj)
+  auto t_wt_gate_ = t_wt_gate;
+  auto t_wt_up_ = t_wt_up;
+  auto t_wt_down_ = t_wt_down;
+  
+  auto in_sizes = t_in.sizes();
+  auto BS = in_sizes[0] * in_sizes[1];
+  bool large_cache_opt = false;
+  if (BS > FT_OPT_SIZE) {
+    t_wt_gate_ = wt_tensor_for_first_token<T>(t_wt_gate_);
+    t_wt_up_ = wt_tensor_for_first_token<T>(t_wt_up_);
+    t_wt_down_ = wt_tensor_for_first_token<T>(t_wt_down_);
+    large_cache_opt = true;
+  }
+
+  auto wt_gate_sizes = t_wt_gate_.sizes();
+  auto wt_down_sizes = t_wt_down_.sizes();
+  auto C = in_sizes[2];
+
+  auto Nc = wt_gate_sizes[1];
+  auto Hc = C / Nc;
+  auto Nk_inter = wt_gate_sizes[0];  // Intermediate dimension
+  auto Hk_inter = wt_gate_sizes[3];
+  auto K_inter = Nk_inter * Hk_inter;
+  
+  auto Nk = wt_down_sizes[0];  // Output dimension
+  auto Hk = wt_down_sizes[3];
+  auto K = Nk * Hk;
+
+  // Prepare weight tensors for forward pass
+  auto t_wt_gate_V =
+      torch_ipex::tpp::wt_tensor_for_fwd(Nk_inter, Hk_inter, Nc, Hc, t_wt_gate_);
+  auto t_wt_up_V = 
+      torch_ipex::tpp::wt_tensor_for_fwd(Nk_inter, Hk_inter, Nc, Hc, t_wt_up_);
+  auto t_wt_down_V = 
+      torch_ipex::tpp::wt_tensor_for_fwd(Nk, Hk, Nk_inter, Hk_inter, t_wt_down_);
+
+  // Intermediate tensor to store SwiGLU output
+  auto t_swiglu_out = at::empty({in_sizes[0], in_sizes[1], K_inter}, t_in.options());
+
+  auto in = GetVLAPtr<T>(t_in, {Nc, Hc});
+  auto wt_gate_V = GetVLAPtr<T>(t_wt_gate_V, {Nc, Hc * Hk_inter});
+  auto wt_up_V = GetVLAPtr<T>(t_wt_up_V, {Nc, Hc * Hk_inter});
+  auto wt_down_V = GetVLAPtr<T>(t_wt_down_V, {Nk_inter, Hk_inter * Hk});
+  auto bias_gate = GetVLAPtr<T>(t_bias_gate, {Hk_inter});
+  auto bias_up = GetVLAPtr<T>(t_bias_up, {Hk_inter});
+  auto bias_down = GetVLAPtr<T>(t_bias_down, {Hk});
+  auto swiglu_out = GetVLAPtr<T>(t_swiglu_out, {Nk_inter, Hk_inter});
+  auto out = GetVLAPtr<T>(t_out, {Nk, Hk});
+
+  // Temporary tensor for gate output before SwiGLU
+  auto t_gate_tmp = at::empty_like(t_swiglu_out);
+  auto gate_tmp = GetVLAPtr<T>(t_gate_tmp, {Nk_inter, Hk_inter});
+
+  auto Ncb = Nc;
+  auto BSb = 64L;
+  auto rem = BS % 64;
+  if (large_cache_opt)
+    Ncb = NCB_BLOCK_SIZE;
+
+  bool with_bias_gate = (t_bias_gate.numel() > 0);
+  bool with_bias_up = (t_bias_up.numel() > 0);
+  bool with_bias_down = (t_bias_down.numel() > 0);
+
+  // Step 1: Compute gate and up projections with SwiGLU activation
+  auto copy_bias_gate_tpp = SCOPEIT(CpyBiasTPP<T>(BSb, Hk_inter, K_inter), BIAS);
+  auto copy_bias_gate_tpp_rem = SCOPEIT(CpyBiasTPP<T>(rem, Hk_inter, K_inter), BIAS);
+  auto copy_bias_up_tpp = SCOPEIT(CpyBiasTPP<T>(BSb, Hk_inter, K_inter), BIAS);
+  auto copy_bias_up_tpp_rem = SCOPEIT(CpyBiasTPP<T>(rem, Hk_inter, K_inter), BIAS);
+  auto zero_tpp = SCOPEIT(SetZeroTPP<T>(BSb, Hk_inter, K_inter), EW_ZERO);
+  auto zero_tpp_rem = SCOPEIT(SetZeroTPP<T>(rem, Hk_inter, K_inter), EW_ZERO);
+  
+  auto brgemm_gate_tpp = SCOPEITGEMM((BrgemmTPP<T, T>(
+      BSb, Hk_inter, Hc, Hc, Hk_inter * Hc, C, Hk_inter, K_inter, 1.0, 0, Ncb, b_vnni)));
+  auto brgemm_gate_tpp_rem = SCOPEITGEMM((BrgemmTPP<T, T>(
+      rem, Hk_inter, Hc, Hc, Hk_inter * Hc, C, Hk_inter, K_inter, 1.0, 0, Ncb, b_vnni)));
+  
+  auto silu_fwd_tpp = SCOPEIT(SiLUFwdTPP<T>(BSb, Hk_inter, K_inter, K_inter), ACT);
+  auto silu_fwd_tpp_rem = SCOPEIT(SiLUFwdTPP<T>(rem, Hk_inter, K_inter, K_inter), ACT);
+  auto mul_tpp = SCOPEIT((MulTPP<T, T>(BSb, Hk_inter, K_inter, K_inter)), EW_MUL);
+  auto mul_tpp_rem = SCOPEIT((MulTPP<T, T>(rem, Hk_inter, K_inter, K_inter)), EW_MUL);
+
+  {
+    RECORD_SCOPE(tpp_fused_gate_up_proj_krnl, {t_in, t_wt_gate_V});
+    
+    auto loop_scheme = large_cache_opt ? GEMM_LOOP_SCHEME : "aCb";
+    auto igemm_loop = torch_ipex::tpp::ThreadedLoop<3>(
+        {{0, Nc, Ncb, false}, {0, BS, BSb}, {Nk_inter}}, loop_scheme);
+    igemm_loop(
+        [&](int* ind) {
+          int nc = ind[0], s1 = ind[1], nk = ind[2];
+          auto count = nc + Ncb < Nc ? Ncb : Nc - nc;
+          bool is_rem = (s1 + BSb > BS);
+          if (!is_rem) {
+            if (nc == 0) {
+              if (with_bias_gate) {
+                copy_bias_gate_tpp(bias_gate[nk], gate_tmp[s1][nk]);
+              } else {
+                zero_tpp(gate_tmp[s1][nk]);
+              }
+              if (with_bias_up) {
+                copy_bias_up_tpp(bias_up[nk], swiglu_out[s1][nk]);
+              } else {
+                zero_tpp(swiglu_out[s1][nk]);
+              }
+            }
+            brgemm_gate_tpp(in[s1][nc], wt_gate_V[nk][nc], gate_tmp[s1][nk], count, true);
+            brgemm_gate_tpp(in[s1][nc], wt_up_V[nk][nc], swiglu_out[s1][nk], count, true);
+            if (!(nc + Ncb < Nc)) { // last nc iter - apply SwiGLU: silu(gate) * up
+              silu_fwd_tpp(gate_tmp[s1][nk], gate_tmp[s1][nk]);
+              mul_tpp(gate_tmp[s1][nk], swiglu_out[s1][nk], swiglu_out[s1][nk]);
+            }
+          } else {
+            if (nc == 0) {
+              if (with_bias_gate) {
+                copy_bias_gate_tpp_rem(bias_gate[nk], gate_tmp[s1][nk]);
+              } else {
+                zero_tpp_rem(gate_tmp[s1][nk]);
+              }
+              if (with_bias_up) {
+                copy_bias_up_tpp_rem(bias_up[nk], swiglu_out[s1][nk]);
+              } else {
+                zero_tpp_rem(swiglu_out[s1][nk]);
+              }
+            }
+            brgemm_gate_tpp_rem(in[s1][nc], wt_gate_V[nk][nc], gate_tmp[s1][nk], count, false);
+            brgemm_gate_tpp_rem(in[s1][nc], wt_up_V[nk][nc], swiglu_out[s1][nk], count, false);
+            brgemm_gate_tpp.config();
+            if (!(nc + Ncb < Nc)) {
+              silu_fwd_tpp_rem(gate_tmp[s1][nk], gate_tmp[s1][nk]);
+              mul_tpp_rem(gate_tmp[s1][nk], swiglu_out[s1][nk], swiglu_out[s1][nk]);
+            }
+          }
+        },
+        [&]() { brgemm_gate_tpp.config(); },
+        [&]() { brgemm_gate_tpp.release(); });
+  }
+
+  // Step 2: Down projection
+  // NOTE: Here is where AMX assembly-level optimization can be integrated
+  // The user should implement optimized matrix multiplication with AMX intrinsics
+  auto Ncb_down = Nk_inter;
+  if (large_cache_opt)
+    Ncb_down = NCB_BLOCK_SIZE;
+  
+  auto copy_bias_down_tpp = SCOPEIT(CpyBiasTPP<T>(BSb, Hk, K), BIAS);
+  auto copy_bias_down_tpp_rem = SCOPEIT(CpyBiasTPP<T>(rem, Hk, K), BIAS);
+  auto zero_down_tpp = SCOPEIT(SetZeroTPP<T>(BSb, Hk, K), EW_ZERO);
+  auto zero_down_tpp_rem = SCOPEIT(SetZeroTPP<T>(rem, Hk, K), EW_ZERO);
+  
+  auto brgemm_down_tpp = SCOPEITGEMM((BrgemmTPP<T, T>(
+      BSb, Hk, Hk_inter, Hk_inter, Hk * Hk_inter, K_inter, Hk, K, 1.0, 0, Ncb_down, b_vnni)));
+  auto brgemm_down_tpp_rem = SCOPEITGEMM((BrgemmTPP<T, T>(
+      rem, Hk, Hk_inter, Hk_inter, Hk * Hk_inter, K_inter, Hk, K, 1.0, 0, Ncb_down, b_vnni)));
+
+  {
+    RECORD_SCOPE(tpp_linear_krnl, {t_swiglu_out, t_wt_down_V});
+    
+    auto loop_scheme_down = large_cache_opt ? GEMM_LOOP_SCHEME : "aCb";
+    auto down_loop = torch_ipex::tpp::ThreadedLoop<3>(
+        {{0, Nk_inter, Ncb_down, false}, {0, BS, BSb}, {Nk}}, loop_scheme_down);
+    down_loop(
+        [&](int* ind) {
+          int nc = ind[0], s1 = ind[1], nk = ind[2];
+          auto count = nc + Ncb_down < Nk_inter ? Ncb_down : Nk_inter - nc;
+          bool is_rem = (s1 + BSb > BS);
+          if (!is_rem) {
+            if (nc == 0) {
+              if (with_bias_down) {
+                copy_bias_down_tpp(bias_down[nk], out[s1][nk]);
+              } else {
+                zero_down_tpp(out[s1][nk]);
+              }
+            }
+            brgemm_down_tpp(swiglu_out[s1][nc], wt_down_V[nk][nc], out[s1][nk], count, true);
+          } else {
+            if (nc == 0) {
+              if (with_bias_down) {
+                copy_bias_down_tpp_rem(bias_down[nk], out[s1][nk]);
+              } else {
+                zero_down_tpp_rem(out[s1][nk]);
+              }
+            }
+            brgemm_down_tpp_rem(swiglu_out[s1][nc], wt_down_V[nk][nc], out[s1][nk], count, false);
+            brgemm_down_tpp.config();
+          }
+        },
+        [&]() { brgemm_down_tpp.config(); },
+        [&]() { brgemm_down_tpp.release(); });
+  }
+}
+
+template <typename T>
 inline void tpp_linear_add(
     const at::Tensor t_in,
     const at::Tensor t_in1,
