@@ -662,6 +662,23 @@ def meta_tpp_fused_gate_up_proj(
     return t_in.new_empty((*t_in.shape[:-1], out_features))
 
 
+@register_meta("tpp_ffn_swiglu")
+def meta_tpp_ffn_swiglu(
+    t_in,
+    t_wt_gate,
+    t_bias_gate,
+    t_wt_up,
+    t_bias_up,
+    t_wt_down,
+    t_bias_down,
+):
+    # Output shape is determined by down projection weight
+    # Assuming t_wt_down has shape [out_features, intermediate_dim, block_size, block_size]
+    wt_down_sizes = t_wt_down.size()
+    out_features = wt_down_sizes[0] * wt_down_sizes[3]
+    return t_in.new_empty((*t_in.shape[:-1], out_features))
+
+
 @torch.library.register_fake("torch_ipex::masked_multihead_self_attention")
 def meta_masked_multihead_self_attention(
     query,

@@ -289,6 +289,55 @@ def gelu_mul(
     return f(x, y, out, approximate)
 
 
+def ffn_swiglu_fusion(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_bias: torch.Tensor,
+):
+    r"""
+    Fuses FFN layer with SwiGLU activation using AMX for matrix multiplication.
+    Implements: down(silu(gate(x)) * up(x))
+    
+    This is a placeholder function where the AMX-optimized implementation
+    can be added. The detailed AMX assembly implementation should be
+    integrated into the C++ kernel.
+
+    Args:
+        input (torch.Tensor): input tensor, shape [batch_size, seq_len, hidden_size].
+        gate_weight (torch.Tensor): gate projection weight tensor.
+        gate_bias (torch.Tensor): gate projection bias tensor.
+        up_weight (torch.Tensor): up projection weight tensor.
+        up_bias (torch.Tensor): up projection bias tensor.
+        down_weight (torch.Tensor): down projection weight tensor.
+        down_bias (torch.Tensor): down projection bias tensor.
+
+    Returns:
+        torch.Tensor: output tensor after FFN with SwiGLU activation.
+    
+    """
+    # For CPU device, call the TPP optimized kernel
+    if input.device.type == "cpu":
+        return torch.ops.torch_ipex.tpp_ffn_swiglu(
+            input,
+            gate_weight,
+            gate_bias,
+            up_weight,
+            up_bias,
+            down_weight,
+            down_bias,
+        )
+    else:
+        # Fallback implementation for non-CPU devices
+        gate_out = torch.nn.functional.linear(input, gate_weight, gate_bias)
+        up_out = torch.nn.functional.linear(input, up_weight, up_bias)
+        swiglu_out = torch.nn.functional.silu(gate_out) * up_out
+        return torch.nn.functional.linear(swiglu_out, down_weight, down_bias)
+
+
 def add_rms_norm(
     residual: torch.Tensor,
     x: torch.Tensor,

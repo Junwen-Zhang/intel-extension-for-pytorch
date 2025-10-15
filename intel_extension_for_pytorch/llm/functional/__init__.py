@@ -8,6 +8,7 @@ from .fusions import (
     add_rms_norm,
     silu_mul,
     gelu_mul,
+    ffn_swiglu_fusion,
     bgmv_shrink,
     sgmv_shrink,
     bgmv_expand,

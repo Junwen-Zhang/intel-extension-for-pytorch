@@ -209,6 +209,78 @@ at::Tensor tpp_fused_gate_up_proj_kernel_impl(
   return t_out;
 }
 
+at::Tensor tpp_ffn_swiglu_kernel_impl(
+    const at::Tensor& t_in,
+    const at::Tensor& t_wt_gate,
+    const at::Tensor& t_bias_gate,
+    const at::Tensor& t_wt_up,
+    const at::Tensor& t_bias_up,
+    const at::Tensor& t_wt_down,
+    const at::Tensor& t_bias_down) {
+  bool reshape_activation = false;
+  auto t_in_ = t_in;
+  if (t_in.dim() == 2) {
+    reshape_activation = true;
+    t_in_ = t_in.unsqueeze(0);
+  }
+  auto sizes = t_in_.sizes().vec();
+  
+  // Final output size is determined by down projection
+  auto wt_down_sizes = t_wt_down.sizes();
+  sizes[2] = wt_down_sizes[0] * wt_down_sizes[3];
+
+  auto t_out = t_in_.new_empty(sizes);
+
+  auto dt = t_wt_gate.dtype();
+  if (dt == at::kFloat) {
+    torch_ipex::tpp::tpp_ffn_swiglu<float>(
+        t_in_,
+        t_wt_gate,
+        t_bias_gate,
+        t_wt_up,
+        t_bias_up,
+        t_wt_down,
+        t_bias_down,
+        t_out,
+        VNNI_OFF);
+  } else if (dt == at::kBFloat16) {
+    torch_ipex::tpp::tpp_ffn_swiglu<at::BFloat16>(
+        t_in_,
+        t_wt_gate,
+        t_bias_gate,
+        t_wt_up,
+        t_bias_up,
+        t_wt_down,
+        t_bias_down,
+        t_out,
+        VNNI_ON);
+  } else if (dt == at::kHalf) {
+    TORCH_CHECK(
+        torch_ipex::utils::isa_has_amx_fp16_support(),
+        "TPP does not support fp16 on platforms without amx_fp16 support");
+    torch_ipex::tpp::tpp_ffn_swiglu<at::Half>(
+        t_in_,
+        t_wt_gate,
+        t_bias_gate,
+        t_wt_up,
+        t_bias_up,
+        t_wt_down,
+        t_bias_down,
+        t_out,
+        VNNI_ON);
+  } else {
+    AT_ASSERT(
+        0,
+        "TPP does not support current weight dtype %s:%d\n",
+        __FILE__,
+        __LINE__);
+  }
+  if (reshape_activation) {
+    return t_out.squeeze(0);
+  }
+  return t_out;
+}
+
 at::Tensor tpp_linear_silu_kernel_impl(
     const at::Tensor& t_in,
     const at::Tensor& t_wt,
@@ -495,6 +567,9 @@ IPEX_REGISTER_DISPATCH(
 IPEX_REGISTER_DISPATCH(
     tpp_fused_gate_up_proj_kernel_stub,
     &tpp_fused_gate_up_proj_kernel_impl);
+IPEX_REGISTER_DISPATCH(
+    tpp_ffn_swiglu_kernel_stub,
+    &tpp_ffn_swiglu_kernel_impl);
 IPEX_REGISTER_DISPATCH(
     tpp_linear_relu_kernel_stub,
     &tpp_linear_relu_kernel_impl);
